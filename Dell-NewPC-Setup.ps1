@@ -27,7 +27,7 @@
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # ⚠️ UPDATE THIS to your repo's raw URL before publishing:
-$ScriptUrl = "https://raw.githubusercontent.com/jtnvdavid/newpc-setup-dell/refs/heads/main/Dell-NewPC-Setup.ps1"
+$ScriptUrl = "https://raw.githubusercontent.com/jtnvdavid/scripts/refs/heads/main/Dell-NewPC-Setup.ps1"
 
 $DeployRoot       = "C:\Deploy"
 $LocalScriptPath  = Join-Path $DeployRoot "Dell-NewPC-Setup.ps1"
