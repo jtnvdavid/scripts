@@ -21,11 +21,30 @@
 
 .NOTES
     Author:  Jasco Technology
-    Version: 2.0
+    Version: 2.1
     Run from an elevated PowerShell prompt on a fresh Dell PC.
+
+    ── CHANGES IN 2.1 ────────────────────────────────────────────────────────
+    * FIXED reboot loop: DCU exit codes 3003/3004/3005 mean "the Dell Client
+      Management Service is BUSY - wait and retry", NOT "a self-update is
+      available". v2.0 responded by reinstalling DCU and rebooting, which
+      restarted the service, re-armed its self-update, and killed the in-flight
+      self-update mid-install. That guaranteed an infinite loop. These codes now
+      trigger a bounded wait-and-poll instead.
+    * Added a busy counter that PERSISTS ACROSS REBOOTS ($BusyFile). The old
+      $MaxDCUCycles guard reset to 0 on every boot, so it could never catch a
+      reboot loop.
+    * Added Wait-DcuService: Phase 2 now waits for the Dell Client Management
+      Service to be running and settled before firing the first dcu-cli command.
+    * Launcher retries the GitHub fetch (DNS is often not ready at logon) and
+      logs which copy of the script actually ran.
+    * Removed the invalid "/configure -reboot=disable" call (-reboot is an
+      /applyUpdates option, not a /configure option).
 #>
 
 # ── Configuration ────────────────────────────────────────────────────────────
+$ScriptVersion = "2.1"
+
 # ⚠️ UPDATE THIS to your repo's raw URL before publishing:
 $ScriptUrl = "https://raw.githubusercontent.com/jtnvdavid/scripts/refs/heads/main/Dell-NewPC-Setup.ps1"
 
@@ -34,6 +53,7 @@ $LocalScriptPath  = Join-Path $DeployRoot "Dell-NewPC-Setup.ps1"
 $LauncherPath     = Join-Path $DeployRoot "Launch-Setup.ps1"
 $PhaseFile        = Join-Path $DeployRoot "deploy-phase.txt"
 $WUCycleFile      = Join-Path $DeployRoot "wu-cycle.txt"
+$BusyFile         = Join-Path $DeployRoot "dcu-busy-count.txt"
 $LogFile          = Join-Path $DeployRoot "deploy-log.txt"
 $TaskName         = "DellNewPCSetup"
 
@@ -42,6 +62,7 @@ $DCU_DownloadURL  = "https://dl.dell.com/FOLDER12591980M/1/Dell-Command-Update-A
 $DCU_InstallerPath = Join-Path $DeployRoot "DCU_Setup.exe"
 $DCU_CLI          = "C:\Program Files\Dell\CommandUpdate\dcu-cli.exe"
 $DCU_CLI_Alt      = "C:\Program Files (x86)\Dell\CommandUpdate\dcu-cli.exe"
+$DCU_ServiceName  = "DellClientManagementService"
 
 # .NET 8 Desktop Runtime (required by newer DCU versions)
 $DotNet8_URL      = "https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/8.0.24/windowsdesktop-runtime-8.0.24-win-x64.exe"
@@ -50,6 +71,14 @@ $DotNet8_Installer = Join-Path $DeployRoot "dotnet8-desktop-runtime.exe"
 # Maximum update cycles before giving up (per update system)
 $MaxDCUCycles     = 5
 $MaxWUCycles      = 5
+
+# DCU "service busy" handling
+$BusyPollSeconds  = 30    # how often to re-probe while the service is busy
+$BusyMaxWait      = 900   # max seconds to wait in a single boot (15 min)
+$MaxBusyReboots   = 2     # reboots allowed to clear a busy service before escalating
+
+# DCU exit codes that mean "the service is busy - wait, don't act"
+$DcuBusyCodes     = @(3003, 3004, 3005)
 
 # Ensure modern TLS for all downloads (old Win10 images default to TLS 1.0)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -96,19 +125,49 @@ function Write-Launcher {
         Write a small launcher that the scheduled task runs at each logon.
         It tries GitHub first (always latest version), then falls back to
         the local cached copy.
+
+        v2.1: retries the fetch. At logon the NIC/DNS often isn't ready yet,
+        which is why machines silently fall back to a stale cached script.
     #>
     $launcherContent = @"
 `$ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-try {
-    Write-Host 'Fetching latest setup script from GitHub...' -ForegroundColor Yellow
-    `$scriptText = Invoke-RestMethod -Uri '$ScriptUrl' -UseBasicParsing
-    Set-Content -Path '$LocalScriptPath' -Value `$scriptText -Force
-    Write-Host 'Running latest version from GitHub.' -ForegroundColor Green
+
+`$logFile = '$LogFile'
+function Write-LauncherLog {
+    param([string]`$m)
+    `$e = "[`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] LAUNCHER: `$m"
+    Write-Host `$e -ForegroundColor Yellow
+    Add-Content -Path `$logFile -Value `$e -ErrorAction SilentlyContinue
 }
-catch {
-    Write-Host "GitHub unreachable (`$_). Using cached local copy." -ForegroundColor Yellow
+
+# Wait for the network stack to come up before trying GitHub
+for (`$i = 1; `$i -le 12; `$i++) {
+    if (Test-Connection -ComputerName 1.1.1.1 -Count 1 -Quiet -ErrorAction SilentlyContinue) { break }
+    Write-LauncherLog "Waiting for network (attempt `$i/12)..."
+    Start-Sleep -Seconds 10
 }
+
+`$gotLatest = `$false
+for (`$i = 1; `$i -le 3; `$i++) {
+    try {
+        Write-LauncherLog "Fetching latest setup script from GitHub (attempt `$i/3)..."
+        `$scriptText = Invoke-RestMethod -Uri '$ScriptUrl' -UseBasicParsing
+        Set-Content -Path '$LocalScriptPath' -Value `$scriptText -Force
+        Write-LauncherLog 'Running LATEST version pulled from GitHub.'
+        `$gotLatest = `$true
+        break
+    }
+    catch {
+        Write-LauncherLog "GitHub fetch failed: `$(`$_.Exception.Message)"
+        Start-Sleep -Seconds 15
+    }
+}
+
+if (-not `$gotLatest) {
+    Write-LauncherLog 'GitHub unreachable after 3 attempts. Running CACHED LOCAL COPY (may be stale).'
+}
+
 & '$LocalScriptPath'
 "@
     Set-Content -Path $LauncherPath -Value $launcherContent -Force
@@ -162,6 +221,19 @@ function Set-WUCycle {
     Set-Content -Path $WUCycleFile -Value $Cycle -Force
 }
 
+# ── Reboot-Loop Guard (persists across reboots) ──────────────────────────────
+function Get-BusyCount {
+    if (Test-Path $BusyFile) {
+        return [int](Get-Content $BusyFile -Raw).Trim()
+    }
+    return 0
+}
+
+function Set-BusyCount {
+    param([int]$Count)
+    Set-Content -Path $BusyFile -Value $Count -Force
+}
+
 # ── Reusable Download Helper ─────────────────────────────────────────────────
 function Get-FileDownload {
     param(
@@ -200,6 +272,85 @@ function Get-DCUPath {
     $found = Get-ChildItem "C:\Program Files*\Dell\CommandUpdate\dcu-cli.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($found) { return $found.FullName }
     return $null
+}
+
+# ── Wait for the Dell Client Management Service to be ready ─────────────────
+function Wait-DcuService {
+    <#
+        On a fresh boot the Dell Client Management Service starts and frequently
+        kicks off its own self-update. Any dcu-cli command issued during that
+        window returns 3003/3004/3005. Give it time to settle before we start.
+    #>
+    param([int]$TimeoutSeconds = 300, [int]$SettleSeconds = 90)
+
+    $svc = Get-Service -Name $DCU_ServiceName -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Log "Service '$DCU_ServiceName' not found - continuing without settle wait."
+        return
+    }
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($svc.Status -ne 'Running' -and $sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        Write-Log "Waiting for '$DCU_ServiceName' to start (status: $($svc.Status))..."
+        Start-Sleep -Seconds 10
+        $svc.Refresh()
+    }
+
+    if ($svc.Status -eq 'Running') {
+        Write-Log "'$DCU_ServiceName' is running. Settling ${SettleSeconds}s before first dcu-cli call..."
+        Start-Sleep -Seconds $SettleSeconds
+    }
+    else {
+        Write-Log "WARNING: '$DCU_ServiceName' did not reach Running within ${TimeoutSeconds}s (status: $($svc.Status))."
+    }
+}
+
+# ── Handle DCU "service busy" codes 3003 / 3004 / 3005 ──────────────────────
+function Resolve-DcuBusy {
+    <#
+        Returns:
+          'Clear'    - service freed up, caller should continue the update loop
+          'Reboot'   - caller should register the task, reboot, and return
+          'Escalate' - busy across too many boots; caller should move on
+
+        NEVER reinstalls DCU. Reinstalling restarts the service and re-arms the
+        very self-update we're waiting on - that was the v2.0 loop bug.
+    #>
+    param([string]$DcuPath, [int]$Code)
+
+    Write-Log "DCU service busy (code $Code). The Dell Client Management Service is mid-operation."
+    Write-Log "Waiting for it to finish - NOT reinstalling or rebooting yet."
+
+    $waited     = 0
+    $probeCode  = $Code
+
+    while ($probeCode -in $DcuBusyCodes -and $waited -lt $BusyMaxWait) {
+        Start-Sleep -Seconds $BusyPollSeconds
+        $waited += $BusyPollSeconds
+
+        $probe = Start-Process -FilePath $DcuPath -ArgumentList "/scan","-silent" `
+                    -Wait -PassThru -NoNewWindow
+        $probeCode = $probe.ExitCode
+        Write-Log "  probe at ${waited}s of ${BusyMaxWait}s -> exit $probeCode"
+    }
+
+    if ($probeCode -notin $DcuBusyCodes) {
+        Write-Log "Service is free again (probe returned $probeCode). Resuming update cycle."
+        Set-BusyCount 0
+        return 'Clear'
+    }
+
+    $busyReboots = Get-BusyCount
+    Set-BusyCount ($busyReboots + 1)
+
+    if ($busyReboots -ge $MaxBusyReboots) {
+        Write-Log "Service still busy after $($busyReboots + 1) boots. Giving up on Dell updates."
+        Write-Log "ACTION REQUIRED: check 'Get-Service $DCU_ServiceName' and C:\ProgramData\Dell\UpdateService\Log."
+        return 'Escalate'
+    }
+
+    Write-Log "Still busy after ${BusyMaxWait}s. Rebooting once to clear (reboot $($busyReboots + 1) of $MaxBusyReboots)."
+    return 'Reboot'
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -277,6 +428,9 @@ function Invoke-Phase1 {
     }
 
     # ── Install Dell Command Update ──
+    # NOTE: This is the ONLY place DCU gets installed/reinstalled. Phase 2 must
+    # never reinstall it - doing so restarts the service and re-arms its
+    # self-update, which is what caused the v2.0 reboot loop.
     $dcuPath = Get-DCUPath
     if (-not $dcuPath) {
         Write-Log "Dell Command Update not found. Installing..."
@@ -313,11 +467,17 @@ function Invoke-Phase1 {
         Write-Log "Dell Command Update already installed at: $dcuPath"
     }
 
+    # ── Let the freshly-installed service come up before configuring ──
+    Wait-DcuService -TimeoutSeconds 300 -SettleSeconds 60
+
     # ── Configure DCU for silent operation ──
+    # -reboot is an /applyUpdates option, not a /configure option - removed in 2.1
     Write-Log "Configuring DCU settings..."
-    & $dcuPath /configure -autoSuspendBitLocker=enable 2>$null
-    & $dcuPath /configure -reboot=disable 2>$null
-    & $dcuPath /configure -scheduleManual 2>$null
+    & $dcuPath /configure -autoSuspendBitLocker=enable -scheduleManual -userConsent=disable 2>$null
+    Write-Log "DCU configure exit code: $LASTEXITCODE"
+
+    # Reset the busy counter for a clean run
+    Set-BusyCount 0
 
     Set-Phase 2
     Register-RebootTask
@@ -336,8 +496,13 @@ function Invoke-Phase2 {
     if (-not $dcuPath) {
         Write-Log "ERROR: Cannot find dcu-cli.exe!"
         Set-Phase 3
+        Register-RebootTask
+        Restart-Computer -Force
         return
     }
+
+    # Don't fire commands at a service that's still waking up / self-updating
+    Wait-DcuService -TimeoutSeconds 300 -SettleSeconds 90
 
     $cycle = 0
 
@@ -345,9 +510,11 @@ function Invoke-Phase2 {
         $cycle++
         Write-Log "── Dell Update Cycle $cycle of $MaxDCUCycles ──"
 
-        # Exit codes: 0=no updates needed, 1=reboot required, 2=error,
-        #             3=cancelled, 4=updates found, 5=reboot pending
-        #             500=no applicable updates, 3003=DCU self-update available
+        # Exit codes (Dell Command | Update 5.x reference):
+        #   0=success/no updates  1=reboot required  2=fatal error  5=reboot pending
+        #   500=no applicable updates  501/502/503=scan or download error
+        #   3003=service busy  3004=service self-updating  3005=service installing updates
+        #   -> 3003/3004/3005 all mean WAIT. They do NOT mean "reinstall DCU".
         Write-Log "Running: dcu-cli /applyUpdates -reboot=disable -autoSuspendBitLocker=enable"
 
         $process = Start-Process -FilePath $dcuPath `
@@ -360,6 +527,7 @@ function Invoke-Phase2 {
         switch ($exitCode) {
             0 {
                 Write-Log "No Dell updates needed. Moving to Windows Update phase."
+                Set-BusyCount 0
                 Set-Phase 3
                 Register-RebootTask
                 Write-Log "Rebooting before Windows Update phase..."
@@ -368,6 +536,7 @@ function Invoke-Phase2 {
             }
             1 {
                 Write-Log "Dell updates installed - reboot required."
+                Set-BusyCount 0
                 Register-RebootTask
                 Write-Log "Rebooting..."
                 Start-Sleep -Seconds 5
@@ -382,55 +551,35 @@ function Invoke-Phase2 {
             }
             500 {
                 Write-Log "No applicable Dell updates. Moving to Windows Update phase."
+                Set-BusyCount 0
                 Set-Phase 3
                 Register-RebootTask
                 Write-Log "Rebooting before Windows Update phase..."
                 Restart-Computer -Force
                 return
             }
-            3003 {
-                Write-Log "DCU self-update available (code 3003). Updating Dell Command Update itself..."
+            {$_ -in $DcuBusyCodes} {
+                $action = Resolve-DcuBusy -DcuPath $dcuPath -Code $exitCode
 
-                # Attempt 1: Let DCU self-update via CLI
-                $selfUpdate = Start-Process -FilePath $dcuPath `
-                    -ArgumentList "/applyUpdates","-updateType=application","-reboot=disable" `
-                    -Wait -PassThru -NoNewWindow
-                Write-Log "DCU self-update exit code: $($selfUpdate.ExitCode)"
-
-                # Attempt 2: If self-update didn't clearly succeed, reinstall latest
-                if ($selfUpdate.ExitCode -notin 0,1,5) {
-                    Write-Log "CLI self-update may have failed. Reinstalling latest DCU..."
-                    $winget = Get-Command winget -ErrorAction SilentlyContinue
-                    $reinstalled = $false
-
-                    if ($winget) {
-                        Write-Log "Using winget to reinstall DCU (latest version)..."
-                        winget install Dell.CommandUpdate.Universal --source winget --accept-source-agreements --accept-package-agreements --silent --force
-                        if ($LASTEXITCODE -eq 0) {
-                            Write-Log "DCU reinstalled via winget."
-                            $reinstalled = $true
-                        } else {
-                            Write-Log "Winget reinstall returned exit code $LASTEXITCODE."
-                        }
+                switch ($action) {
+                    'Clear' {
+                        # fall through - the while loop retries /applyUpdates
                     }
-
-                    if (-not $reinstalled) {
-                        Write-Log "Falling back to direct download installer..."
-                        Remove-Item $DCU_InstallerPath -Force -ErrorAction SilentlyContinue
-                        $downloaded = Get-FileDownload -Url $DCU_DownloadURL -Destination $DCU_InstallerPath -Description "Dell Command Update (update)"
-                        if ($downloaded) {
-                            Start-Process -FilePath $DCU_InstallerPath -ArgumentList "/s" -Wait
-                            Start-Sleep -Seconds 10
-                            Write-Log "DCU reinstalled via direct download."
-                        }
+                    'Reboot' {
+                        Register-RebootTask
+                        Start-Sleep -Seconds 5
+                        Restart-Computer -Force
+                        return
+                    }
+                    'Escalate' {
+                        Set-BusyCount 0
+                        Set-Phase 3
+                        Register-RebootTask
+                        Write-Log "Skipping Dell updates. Moving to Windows Update phase."
+                        Restart-Computer -Force
+                        return
                     }
                 }
-
-                Register-RebootTask
-                Write-Log "Rebooting to complete DCU self-update..."
-                Start-Sleep -Seconds 5
-                Restart-Computer -Force
-                return
             }
             {$_ -in 501,502,503,1000,1001,1002} {
                 Write-Log "DCU error (code $_). Retrying..."
@@ -444,6 +593,7 @@ function Invoke-Phase2 {
     }
 
     Write-Log "Max Dell update cycles reached. Moving to Windows Update phase."
+    Set-BusyCount 0
     Set-Phase 3
     Register-RebootTask
     Restart-Computer -Force
@@ -582,6 +732,7 @@ function Invoke-Phase4 {
     Remove-Item $DotNet8_Installer -Force -ErrorAction SilentlyContinue
     Remove-Item $PhaseFile -Force -ErrorAction SilentlyContinue
     Remove-Item $WUCycleFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $BusyFile -Force -ErrorAction SilentlyContinue
     Remove-Item $LauncherPath -Force -ErrorAction SilentlyContinue
 
     Write-Log "Cleanup complete."
@@ -630,7 +781,7 @@ if (-not (Test-Path $DeployRoot)) {
 Save-LocalCopy
 
 $phase = Get-Phase
-Write-Log "Starting Phase $phase on $($env:COMPUTERNAME)"
+Write-Log "Starting Phase $phase on $($env:COMPUTERNAME) [script v$ScriptVersion]"
 
 switch ($phase) {
     0 { Invoke-Phase0 }
